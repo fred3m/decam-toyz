@@ -1,0 +1,6 @@
+*.pyc
+*.egg
+
+build
+decamtoyz.egg-info
+dist
