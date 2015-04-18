@@ -165,7 +165,7 @@ class Pipeline:
     def run_psfex(self, exposures):
         pass
     
-    def run_scamp(self, exposures, groupby=[]):
+    def run_scamp(self, catalogs, groupby=[]):
         pass
     
     def run_swarp(self, exposures, frames=None, groupby=[]):
@@ -184,7 +184,8 @@ class Pipeline:
             exposures = pandas.read_sql("select * from decam_obs", self.idx)
         objects = exposures['object'].str.split('-').apply(pandas.Series).sort(0)[0].unique()
         print('Reducing fields:\n', objects)
-        obs_tree = self.fill_obs_tree(obs_tree)
+        
+        
             
         for obj in objects:
             print('OBJECT', obj)
@@ -331,10 +332,11 @@ class Pipeline:
                     sex.run(stack_name)
 
 class PipelineStep:
-    def __init__(self, code, sql=None, exposures=None, pre_func=None, post_func=None):
-        if code not in api.codes:
+    def __init__(self, api_kwargs, sql=None, exposures=None, pre_func=None, post_func=None):
+        self.api_kwargs = copy.deepcopy(api_kwargs)
+        self.code = api_kwargs['code']
+        if self.code not in api.codes:
             raise PipelineError("Code must be one of "+','.join(api.codes.keys()))
-        self.code = code
         self.exposures = exposures
         self.sql = sql
         self.pre_func = pre_func
