@@ -56,7 +56,8 @@ class PipelineError(ToyzError):
 class Pipeline:
     def __init__(self, img_path, idx_connect_str, temp_path, cat_path, 
             result_path=None, resamp_path=None, stack_path=None,
-            config_path=None, build_paths={}, create_idx = False):
+            config_path=None, build_paths={}, create_idx = False,
+            default_kwargs={}):
         """
         - img_path: path to decam images
         - idx_connect_str: sqlalchemy connection string to decam index database
@@ -92,6 +93,7 @@ class Pipeline:
         self.resamp_path = resamp_path
         self.stack_path = stack_path
         self.build_paths = build_paths
+        self.default_kwargs = default_kwargs
         # IF the user doesn't specify a path for config files, use the default decam config files
         if config_path is None:
             from decam import root
@@ -159,8 +161,11 @@ class Pipeline:
         print('Total Observations for {0}: {1}'.format(obj, total_obs))
         return obs
     
-    def run_sex(self, exposures, frames=None):
-        pass
+    def run_sex(self, files, kwargs, frames=None):
+        if 'cmd' not in kwargs:
+            if 'SExtrator' in self.build_paths:
+                kwargs['cmd'] = self.build_paths
+        if 
     
     def run_psfex(self, exposures):
         pass
@@ -175,6 +180,9 @@ class Pipeline:
         return pandas.read_sql(sql, self.idx)
     
     def run(self, steps=pipeline_steps, exposures=None, sql=None):
+        """
+        Run the pipeline given a list of PipelineSteps
+        """
         # If no dataframe of exposures is passed to the function, load them from 
         # the index
         if exposures is None:
@@ -185,7 +193,13 @@ class Pipeline:
         objects = exposures['object'].str.split('-').apply(pandas.Series).sort(0)[0].unique()
         print('Reducing fields:\n', objects)
         
-        
+        for step in pipeline_steps:
+            if step.code == 'SExtractor:':
+                if step.prefunc is not None:
+                    step.prefunc(step, exposures)
+                self.run_sex(exposures, step.api_kwargs, **step.kwargs)
+                if step.postfunc is not None:
+                    step.postfunc(step, exposures)
             
         for obj in objects:
             print('OBJECT', obj)
@@ -332,7 +346,8 @@ class Pipeline:
                     sex.run(stack_name)
 
 class PipelineStep:
-    def __init__(self, api_kwargs, sql=None, exposures=None, pre_func=None, post_func=None):
+    def __init__(self, api_kwargs, sql=None, exposures=None, pre_func=None, post_func=None,
+            **kwargs):
         self.api_kwargs = copy.deepcopy(api_kwargs)
         self.code = api_kwargs['code']
         if self.code not in api.codes:
@@ -341,47 +356,8 @@ class PipelineStep:
         self.sql = sql
         self.pre_func = pre_func
         self.post_func = post_func
+        self.kwargs = kwargs
 
-# variables used to test pipeline (TODO: remove these once the pipeline is working)
-obj = 'SDSSJ1442'
-frames = '1'
-obj_kwargs = {
-    'nights': ['2013-05-29'],
-    
-}
-
-# Set defaults
-dec_path = '/media/data-beta/users/fmooleka/decam'
-connection = 'sqlite:////media/data-beta/users/fmooleka/decam/2013A-0723/2013A-0723_idx.db'
-temp_path = os.path.join(dec_path, 'temp')
-build_path = '/media/data-beta/users/fmooleka/astromatic/build'
-config_path = os.path.join(dec_path, 'config')
-cat_path = os.path.join(dec_path, 'catalogs')
-stack_path = os.path.join(dec_path, '2013A-0723', 'mystacks')
-
-# Sextractor parameters
-sex_cmd = os.path.join(build_path, 'sextractor/bin/sex')
-sex_path = os.path.join(dec_path, 'sex')
-# SCAMP parameters
-scamp_cmd = sex_cmd.replace('sextractor', 'scamp').replace('sex', 'scamp')
-scamp_path = os.path.join(dec_path, 'scamp')
-# SWarp parameters
-swarp_cmd = scamp_cmd.replace('scamp', 'swarp')
-swarp_path = os.path.join(dec_path, 'swarp')
-# PSFex parameters
-psfex_cmd = scamp_cmd.replace('scamp', 'psfex')
-psfex_path = os.path.join(dec_path, 'psfex')
-
-# connect to database
-engine = create_engine(connection)
-
-objects = pandas.read_sql("select * from decam_obs", engine)
-o = objects['object'].str.split('-').apply(pandas.Series)
-print('All fields:\n', o.sort(0)[0].unique())
-o = o[(o[0].str.startswith('F')) | (o[0].str.startswith('SDSS'))].sort(0)[0].unique()
-
-# Temporary fix to only run a single objct
-o = [obj]
 sex_kwargs = {
     'code': 'SExtractor',
     'temp_path': temp_path,
