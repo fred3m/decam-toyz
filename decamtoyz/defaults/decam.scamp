@@ -22,7 +22,7 @@ ASTREF_BAND            DEFAULT         # Photom. band for astr.ref.magnitudes
                                        # Local ref.cat.error ellipse parameters
 #ASTREFMAG_KEY          MAG             # Local ref.cat.magnitude parameter
 #ASTREFMAG_LIMITS       -99.0,99.0      # Select magnitude range in ASTREF_BAND
-SAVE_REFCATALOG        Y               # Save ref catalogs in FITS-LDAC format?
+SAVE_REFCATALOG        N               # Save ref catalogs in FITS-LDAC format?
 REFOUT_CATPATH         .               # Save path for reference catalogs
  
 #--------------------------- Merged output catalogs ---------------------------

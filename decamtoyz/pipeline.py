@@ -6,10 +6,11 @@ from sqlalchemy import create_engine
 import subprocess
 import copy
 from collections import OrderedDict
+import logging as log
 import astropy.io.fits as pyfits
 
 from toyz.utils.errors import ToyzError
-import astrotoyz.astromatic.api as api
+from astrotoyz.astromatic import api
 
 """
 Improvements to make before pipeline is finished
@@ -21,16 +22,14 @@ Improvements to make before pipeline is finished
 6) Create .ahead with FILTER, (create) AIRMASS, EQUINOX
 """
 
-pipeline_steps = ['sex_nopsf', 'scamp', 'resample', 'stack', 'sex_for_psf', 'psfex', 'sex_psf']
-
-def _get_fits_name(expnum, prodtype):
+def get_fits_name(expnum, prodtype):
     if prodtype=='image':
         fits_name = '{0}.fits'.format(expnum)
     else:
         fits_name = "{0}.{1}.fits".format(expnum, prodtype)
     return fits_name
 
-def _funpack_file(filename, fits_path):
+def funpack_file(filename, fits_path):
     """
     Funpack a compressed fits file and copy it to a new path
     """
@@ -48,7 +47,7 @@ def check_path(pathname, path):
         if core.get_bool("{0} '{1}' does not exist, create (y/n)?".format(pathname, path)):
             core.create_paths(path)
         else:
-            raise DecamPipeError("{0} does not exist".format(pathname))
+            raise PipelineError("{0} does not exist".format(pathname))
 
 class PipelineError(ToyzError):
     pass
@@ -56,32 +55,48 @@ class PipelineError(ToyzError):
 class Pipeline:
     def __init__(self, img_path, idx_connect_str, temp_path, cat_path, 
             result_path=None, resamp_path=None, stack_path=None,
-            config_path=None, build_paths={}, create_idx = False,
+            config_path=None, build_paths={}, create_idx = None,
             default_kwargs={}):
         """
-        - img_path: path to decam images
-        - idx_connect_str: sqlalchemy connection string to decam index database
-        - temp_path: path to store temporary files
-        - cat_path: path to save final catalogs
-        - result_path: path to save resampled and stacked images
-        - config_path: path to check for astromatic config files
-            * defaults to decamtoyz/defaults
-        - build_paths: dictionary of paths to astromatic builds
-            * Not needed if the codes were installed system wide (ex. 'sex' runs SExtractor)
-            * Keys are commands for astromatic packages ('sex', 'scamp', 'swarp', 'psfex')
-            * Values are the paths to the build for the given key
-        - create_idx: By default, if the decam index DB cannot be found, the user will
-          be prompted to create the index. Setting `create_idx` to `True` overrides this behavior
-          and automatically creates the index
+        Parameters
+        ----------
+        img_path: str
+            path to decam images
+        idx_connect_str: str
+            sqlalchemy connection string to decam index database
+        temp_path: str
+            path to store temporary files
+        cat_path: str
+            path to save final catalogs
+        result_path: str
+            path to save resampled and stacked images
+        config_path: str
+            path to check for astromatic config files
+                * defaults to decamtoyz/defaults
+        build_paths: dict
+            paths to astromatic builds
+                * Not needed if the codes were installed system wide (ex. 'sex' runs SExtractor)
+                * Keys are commands for astromatic packages ('sex', 'scamp', 'swarp', 'psfex')
+                * Values are the paths to the build for the given key
+        create_idx: bool
+            By default, if the decam index DB cannot be found, the user will
+            be prompted to create the index. Setting `create_idx` to `True` overrides 
+            this behavior and automatically creates the index. Setting `create_idx` ``False``
+            will raise an error
         """
         if idx_connect_str.startswith('sqlite'):
-            if not os.path.isfile(idx_connect_str.lstrip('sqlite:///')):
-                if not create_idx:
-                    import toyz.utils.core as core
-                    if not core.get_bool(
-                            "DECam file index does not exist, create it now? ('y'/'n')"):
-                        raise DecamPipeError("Unable to locate DECam file index")
+            if not os.path.isfile(idx_connect_str[10:]):
+                print('path', idx_connect_str[10:])
+                if create_idx is not None:
+                    if create_idx:
+                        import toyz.utils.core as core
+                        if not core.get_bool(
+                                "DECam file index does not exist, create it now? ('y'/'n')"):
+                            raise PipelineError("Unable to locate DECam file index")
+                    else:
+                         raise PipelineError("Unable to locate DECam file index")
                 import decamtoyz.index as index
+                import toyz.utils.core as core
                 recursive = core.get_bool("Search '{0}' recursively for images? ('y'/'n')")
                 index.build_idx(img_path, idx_connect_str, True, recursive, True)
         self.idx = create_engine(idx_connect_str)
@@ -153,7 +168,7 @@ class Pipeline:
                         df = pandas.read_sql(sql, self.idx)
                         total_obs+=1
                         for row in df.iterrows():
-                            fits_name = _get_fits_name(expnum, row[1]['PRODTYPE'])
+                            fits_name = get_fits_name(expnum, row[1]['PRODTYPE'])
                             fits_path = os.path.join(self.temp_path, fits_name)
                             #_funpack_file(row[1]['filename'], fits_path)
                             obs[night][f][exptime][expnum][row[1]['PRODTYPE']] = fits_path
@@ -161,232 +176,201 @@ class Pipeline:
         print('Total Observations for {0}: {1}'.format(obj, total_obs))
         return obs
     
-    def run_sex(self, files, kwargs, frames=None):
-        if 'cmd' not in kwargs:
-            if 'SExtrator' in self.build_paths:
-                kwargs['cmd'] = self.build_paths
-        if 
+    def run_sex(self, files, kwargs={}, frames=None, show_all_cmds=False):
+        """
+        Run SExtractor with a specified set of parameters.
+        
+        Parameters
+        ----------
+        files: dict
+            Dict of filenames for fits files to use in sextractor. Possible keys are:
+                * image: filename of the fits image (required)
+                * dqmask: filename of a bad mixel mask for the given image (optional)
+                * wtmap: filename of a weight map for the given image (optional)
+        kwargs: dict
+            Keyword arguements to pass to ``atrotoyz.Astromatic.run`` or
+            ``astrotoyz.Astromatic.run_sex_frames``
+        frames: str (optional)
+            Only run sextractor on a specific set of frames. This should either be an 
+            integer string, or a string of csv's
+        show_all_cmds: bool (optional)
+            Whether or not to show each command use to execute sextractor (defaults to
+            ``False`` and is only used when running sextractor on multiple frames)
+        """
+        if 'code' not in kwargs:
+            kwargs['code'] = 'SExtractor'
+        if 'cmd' not in kwargs and 'SExtractor' in self.build_paths:
+            kwargs['cmd'] = self.build_paths['SExtractor']
+        if 'temp_path' not in kwargs:
+            kwargs['temp_path'] = self.temp_path
+        if 'config' not in kwargs:
+            kwargs['config'] = {}
+        if 'CATALOG_NAME' not in kwargs['config']:
+            kwargs['config']['CATALOG_NAME'] = files['image'].replace('.fits', '.cat')
+        if 'FLAG_IMAGE' not in kwargs['config'] and 'dqmask' in files:
+            kwargs['config']['FLAG_IMAGE'] = files['dqmask']
+        if 'WEIGHT_IMAGE' not in kwargs['config'] and 'wtmap' in files:
+            kwargs['config']['WEIGHT_IMAGE'] = files['wtmap']
+        sex = api.Astromatic(**kwargs)
+        if frames is None:
+            sex.run(files['image'])
+        else:
+            sex.run_sex_frames(files['image'], frames, show_all_cmds)
     
-    def run_psfex(self, exposures):
-        pass
+    def run_psfex(self, catalogs, kwargs={}):
+        """
+        Run PSFEx with a specified set of parameters.
+        
+        Parameters
+        ----------
+        catalogs: str or list
+            catalog filename (or list of catalog filenames) to use
+        kwargs: dict
+            Keyword arguements to pass to PSFEx
+        """
+        if 'code' not in kwargs:
+            kwargs['code'] = 'PSFEx'
+        if 'cmd' not in kwargs and 'PSFEx' in self.build_paths:
+            kwargs['cmd'] = self.build_paths['PSFEx']
+        if 'temp_path' not in kwargs:
+            kwargs['temp_path'] = self.temp_path
+        psfex = api.Astromatic(**kwargs)
+        psfex.run(catalogs)
     
-    def run_scamp(self, catalogs, groupby=[]):
-        pass
+    def run_scamp(self, catalogs, kwargs={}, save_catalog=None):
+        """
+        Run SCAMP with a specified set of parameters
+        
+        Parameters
+        ----------
+        catalogs: list
+            List of catalog names used to generate astrometric solution
+        kwargs: dict
+            Dictionary of keyword arguments used to run SCAMP
+        save_catalog: str (optional)
+            If ``save_catalog`` is specified, the reference catalog used to generate the
+            solution will be save to the path ``save_catalog``.
+        """
+        if 'code' not in kwargs:
+            kwargs['code'] = 'SCAMP'
+        if 'cmd' not in kwargs and 'SCAMP' in self.build_paths:
+            kwargs['cmd'] = self.build_paths['SCAMP']
+        if 'temp_path' not in kwargs:
+            kwargs['temp_path'] = self.temp_path
+        if 'config' not in kwargs:
+            kwargs['config'] = {}
+        if save_catalog is not None:
+            kwargs['config']['SAVE_REFCATALOG'] = 'Y'
+            kwargs['config']['REFOUT_CATPATH'] = save_catalog
+        scamp = api.Astromatic(**kwargs)
+        scamp.run(catalogs)
     
-    def run_swarp(self, exposures, frames=None, groupby=[]):
-        pass
+    def run_swarp(self, filenames, stack_filename=None, api_kwargs={}, 
+            frames=None, run_type='both'):
+        """
+        Run SWARP with a specified set of parameters
+        
+        Parameters
+        ----------
+        filenames: list
+            List of filenames that are stacked together
+        stack_filename: str (optional)
+            Name of final stacked image. If the user is only resampling but not stacking
+            (``run_type='resample'``), this variable is ignored.
+        api_kwargs: dict
+            Keyword arguments used to run SWARP
+        frames: list (optional)
+            Subset of frames to stack. Default value is ``None``, which stacks all of the
+            image frames for each file
+        run_type: str
+            How SCAMP will be run. Can be ``resample`` or ``stack`` or ``both``, which
+            resamples and stacks the images.
+        """
+        if 'code' not in api_kwargs:
+            api_kwargs['code'] = 'SWarp'
+        if 'cmd' not in api_kwargs and 'SWARP' in self.build_paths:
+            api_kwargs['cmd'] = self.build_paths['SWARP']
+        if 'temp_path' not in api_kwargs:
+            api_kwargs['temp_path'] = self.temp_path
+        if 'config' not in api_kwargs:
+            api_kwargs['config'] = {}
+        if 'RESAMPLE_DIR' not in api_kwargs['config']:
+            api_kwargs['config']['RESAMPLE_DIR'] = api_kwargs['temp_path']
+        if run_type=='both' or run_type=='resample':
+            # Resample images as specified by WCS keywords in their headers
+            log.info("Create resampled images")
+            kwargs = copy.deepcopy(api_kwargs)
+            kwargs['config']['COMBINE'] = 'N'
+            swarp = api.Astromatic(**kwargs)
+            swarp.run(filenames)
+        if run_type=='both' or run_type=='stack':
+            log.info('Creating stack for each CCD')
+            if stack_filename is None:
+                raise PipelineError("Must include a stack_filename to stack a set of images")
+            kwargs = copy.deepcopy(api_kwargs)
+            kwargs['config']['RESAMPLE'] = 'N'
+            if frames is None:
+                hdulist = pyfits.open(filenames[0])
+                frames = range(1,len(hdulist))
+                hdulist.close()
+            # Temporarily create a stack for each frame
+            for frame in frames:
+                resamp_names = [f.replace('.fits', '.{0:04d}.resamp.fits'.format(frame)) 
+                    for f in filenames]
+                stack_frame = os.path.join(kwargs['temp_path'], 
+                    os.path.basename(stack_filename).replace('.fits', 
+                    '-{0:04d}.stack.fits'.format(frame)))
+                kwargs['config']['IMAGEOUT_NAME'] = stack_frame
+                kwargs['config']['WEIGHTOUT_NAME'] = stack_frame.replace('.fits', '.weight.fits')
+                swarp = api.Astromatic(**kwargs)
+                swarp.run(resamp_names)
+            
+            # Combine the frame stacks into a single stacked image
+            log.info("Combining into single stack")
+            primary = pyfits.PrimaryHDU()
+            stack = [primary]
+            weights = [primary]
+            for frame in frames:
+                stack_frame = os.path.join(kwargs['temp_path'], 
+                    os.path.basename(stack_filename).replace('.fits', 
+                    '-{0:04d}.stack.fits'.format(frame)))
+                weight_frame = stack_frame.replace('.fits', '.weight.fits')
+                hdulist = pyfits.open(stack_frame)
+                stack.append(pyfits.ImageHDU(hdulist[0].data,hdulist[0].header))
+                hdulist.close()
+                hdulist = pyfits.open(weight_frame)
+                weights.append(pyfits.ImageHDU(hdulist[0].data,hdulist[0].header))
+            weight_name = stack_filename.replace('.fits', '.wtmap.fits')
+            stack = pyfits.HDUList(stack)
+            stack.writeto(stack_filename, clobber=True)
+            stack.close()
+            weights = pyfits.HDUList(weights)
+            weights.writeto(weight_name, clobber=True)
+            weights.close()
     
     def get_obs(self, sql):
         return pandas.read_sql(sql, self.idx)
     
-    def run(self, steps=pipeline_steps, exposures=None, sql=None):
+    def run(self, steps):
         """
         Run the pipeline given a list of PipelineSteps
         """
-        # If no dataframe of exposures is passed to the function, load them from 
-        # the index
-        if exposures is None:
-            # If no sql to query the index is specified, load all fields in the index
-            if sql is None:
-                sql = "select * from decam_obs"
-            exposures = pandas.read_sql("select * from decam_obs", self.idx)
-        objects = exposures['object'].str.split('-').apply(pandas.Series).sort(0)[0].unique()
-        print('Reducing fields:\n', objects)
-        
         for step in pipeline_steps:
+            if step.prefunc is not None:
+                step.prefunc(step, exposures)
             if step.code == 'SExtractor:':
-                if step.prefunc is not None:
-                    step.prefunc(step, exposures)
-                self.run_sex(exposures, step.api_kwargs, **step.kwargs)
-                if step.postfunc is not None:
-                    step.postfunc(step, exposures)
-            
-        for obj in objects:
-            print('OBJECT', obj)
-            obs_tree = get_obs_tree(engine, temp_path, obj, **obj_kwargs)
-    
-            # TODO: remove the following testing line
-            obs = {'i':obs['i']}
-    
-            # run SExtractor to get positions used for astrometric solutions
-            if 'sex_nopsf' in steps:
-                print('Finding sources to use in astrometric solution\n')
-                for f in obs: # filter is a python keyword, so we use f
-                    for expnum, files in obs[f].items():
-                        kwargs = copy.deepcopy(sex_kwargs)
-                        kwargs['config']['CATALOG_NAME'] = files['image'].replace(
-                            '.fits', '.cat')
-                        kwargs['config']['FLAG_IMAGE'] = files['dqmask']
-                        kwargs['config']['WEIGHT_IMAGE'] = files['wtmap']
-                        kwargs['config']['PARAMETERS_NAME'] = os.path.join(
-                            config_path, 'decam_nopsf.param')
-                        kwargs['config_file'] = os.path.join(config_path, 'decam_nopsf.sex')
-                        #print('\n\n\n', sex_nopsf_kwargs)
-                        sex = api.Astromatic(**kwargs)
-                        #sex.run_sex_frames(files['image'], '1', True)
-                        sex.run(files['image'])
-            # Run SCAMP to get astrometric solution
-            if 'scamp' in steps:
-                print('Calculating astrometric solution\n')
-                for f in obs: # filter is a python keyword, so we use f
-                    cat_paths = [
-                        os.path.join(temp_path, '{0}.cat'.format(expnum)) for expnum in sorted(obs[f])]
-                    scamp_kwargs['config']['REFOUT_CATPATH'] = cat_path
-                    #print('catalog paths', cat_paths)
-                    #print('merged_name', scamp_kwargs['config']['MERGEDOUTCAT_NAME'])
-                    scamp = api.Astromatic(**scamp_kwargs)
-                    scamp.run(cat_paths)
-            # Run SWarp and create stacks
-            if 'stack' in steps or 'resample' in steps:
-                print('Stacking images')
-                """
-                for f in obs: # filter is a python keyword, so we use f
-                    images = [files['image'] for expnum, files in obs[f].items()]
-                    stack_name = os.path.join(stack_path, '{0}-{1}.fits'.format(obj, f))
-                    swarp_kwargs['config']['IMAGEOUT_NAME'] = stack_name
-                    swarp_kwargs['config']['WEIGHTOUT_NAME'] = os.path.join(stack_path,
-                        '{0}-{1}.wtmap.fits'.format(obj, f))
-                    if 'resample' not in steps:
-                        swarp_kwargs['config']['RESAMPLE'] = 'N'
-                    if 'stack' not in steps:
-                        swarp_kwargs['config']['COMBINE'] = 'N'
-                    #print(swarp_kwargs)
-                    swarp = api.Astromatic(**swarp_kwargs)
-                    swarp.run(images)
-                """
-                for f in obs:
-                    if 'resample' in steps:
-                        kwargs = copy.deepcopy(swarp_kwargs)
-                        images = [files['image'] for expnum, files in obs[f].items()]
-                        stack_name = os.path.join(stack_path, '{0}-{1}.fits'.format(obj, f))
-                        kwargs['config']['COMBINE'] = 'N'
-                        #print(kwargs)
-                        swarp = api.Astromatic(**kwargs)
-                        swarp.run(images)
-                
-                    if 'stack' in steps:
-                        kwargs = copy.deepcopy(swarp_kwargs)
-                        exps = obs[f].keys()
-                        hdulist = pyfits.open(obs[f][exps[0]]['image'])
-                        frames = len(hdulist)-1
-                        hdulist.close()
-                        for frame in range(1,frames+1):
-                            images = [os.path.join(temp_path, '{0}.{1:04d}.resamp.fits'.format(
-                                expnum, frame)) for expnum in exps]
-                            stack_name = os.path.join(temp_path, '{0}-{1}-{2:04d}.stack.fits'.format(
-                                obj, f, frame))
-                            kwargs['config']['RESAMPLE'] = 'N'
-                            kwargs['config']['IMAGEOUT_NAME'] = stack_name
-                            kwargs['config']['WEIGHTOUT_NAME'] = stack_name.replace(
-                                '.fits', '.wtmap.fits')
-                            kwargs['config']['WEIGHT_SUFFIX'] = '.weight.fits'
-                            #print(kwargs)
-                            swarp = api.Astromatic(**kwargs)
-                            swarp.run(images)
-                        primary = pyfits.PrimaryHDU()
-                        stack = [primary]
-                        weights = [primary]
-                        print('Combining stack frames')
-                        for frame in range(1,frames+1):
-                            stack_name = os.path.join(temp_path, '{0}-{1}-{2:04d}.stack.fits'.format(
-                                obj, f, frame))
-                            weight_name = stack_name.replace('.fits', '.wtmap.fits')
-                            hdulist = pyfits.open(stack_name)
-                            stack.append(pyfits.ImageHDU(hdulist[0].data,hdulist[0].header))
-                            hdulist.close()
-                            hdulist = pyfits.open(weight_name)
-                            weights.append(pyfits.ImageHDU(hdulist[0].data,hdulist[0].header))
-                        stack_name = os.path.join(stack_path, '{0}-{1}.fits'.format(obj, f))
-                        weight_name = stack_name.replace('.fits', '.wtmap.fits')
-                        stack = pyfits.HDUList(stack)
-                        stack.writeto(stack_name, clobber=True)
-                        stack.close()
-                        weights = pyfits.HDUList(weights)
-                        weights.writeto(weight_name, clobber=True)
-                        weights.close()
-    
-            # Run SExtractor to get positions and vignettes for psfex
-            if 'sex_for_psf' in steps:
-                for f in obs:
-                    stack_name = os.path.join(stack_path, '{0}-{1}.fits'.format(obj, f))
-                    cat_name = os.path.join(temp_path, 
-                        os.path.basename(stack_name.replace('.fits', '.cat')))
-                    kwargs = copy.deepcopy(sex_kwargs)
-                    kwargs['config']['CATALOG_NAME'] = cat_name
-                    kwargs['config']['WEIGHT_IMAGE'] = stack_name.replace('.fits', '.wtmap.fits')
-                    kwargs['config']['PARAMETERS_NAME'] = os.path.join(
-                        config_path, 'decam_for_psf.param')
-                    kwargs['config_file'] = os.path.join(config_path, 'decam_for_psf.sex')
-                    #print('\n\n\n', kwargs)
-                    sex = api.Astromatic(**kwargs)
-                    sex.run(stack_name)
-                    #sex.run_sex_frames(stack_name, '1', True)
-            # Run PSFeX to generate PSF
-            if 'psfex' in steps:
-                for f in obs:
-                    cat_name = os.path.join(temp_path, '{0}-{1}.cat'.format(obj, f))
-                    #print(psfex_kwargs)
-                    psfex = api.Astromatic(**psfex_kwargs)
-                    psfex.run(cat_name)
-            # Run SExtractor with PSF to get improved photometry
-            if 'sex_psf' in steps:
-                for f in obs:
-                    stack_name = os.path.join(stack_path, '{0}-{1}.fits'.format(obj, f))
-                    cat_name = os.path.join(cat_path, '{0}-{1}.cat.fits'.format(obj, f))
-                    kwargs = copy.deepcopy(sex_kwargs)
-                    kwargs['config']['CATALOG_NAME'] = cat_name
-                    kwargs['config']['WEIGHT_IMAGE'] = stack_name.replace('.fits', '.wtmap.fits')
-                    kwargs['config']['PARAMETERS_NAME'] = os.path.join(
-                        config_path, 'decam_psf.param')
-                    kwargs['config']['PSF_NAME'] = os.path.join(temp_path, 
-                        os.path.basename(stack_name.replace('.fits', '.psf')))
-                    kwargs['config_file'] = os.path.join(config_path, 'decam_psf.sex')
-                    #print('\n\n\n', kwargs)
-                    sex = api.Astromatic(**kwargs)
-                    sex.run(stack_name)
+                self.run_sex(step.files, step.api_kwargs, **step.kwargs)
+            if step.postfunc is not None:
+                step.postfunc(step, exposures)
 
 class PipelineStep:
-    def __init__(self, api_kwargs, sql=None, exposures=None, pre_func=None, post_func=None,
+    def __init__(self, files, api_kwargs, pre_func=None, post_func=None,
             **kwargs):
         self.api_kwargs = copy.deepcopy(api_kwargs)
         self.code = api_kwargs['code']
         if self.code not in api.codes:
             raise PipelineError("Code must be one of "+','.join(api.codes.keys()))
-        self.exposures = exposures
-        self.sql = sql
+        self.files
         self.pre_func = pre_func
         self.post_func = post_func
         self.kwargs = kwargs
-
-sex_kwargs = {
-    'code': 'SExtractor',
-    'temp_path': temp_path,
-    'config': {
-        #'CATALOG_TYPE': 'FITS_1.0', # Temporary, to check output catalog
-        'FILTER_NAME': os.path.join(config_path, 'gauss_5.0_9x9.conv')
-    },
-    'cmd': sex_cmd
-}
-scamp_kwargs = {
-    'cmd': scamp_cmd,
-    'code': 'SCAMP',
-    'temp_path': temp_path,
-    'config': {},
-    'config_file': os.path.join(config_path, 'decam.scamp')
-}
-swarp_kwargs = {
-    'cmd': swarp_cmd,
-    'code': 'SWarp',
-    'temp_path': temp_path,
-    'config': {
-        'RESAMPLE_DIR': temp_path
-    },
-    'config_file': os.path.join(config_path, 'decam.swarp')
-}
-psfex_kwargs = {
-    'cmd': psfex_cmd,
-    'code': 'PSFEx',
-    'temp_path': temp_path,
-    'config': {},
-    'config_file': os.path.join(config_path, 'decam.psfex')
-}
