@@ -18,7 +18,7 @@ import decamtoyz.utils as utils
 
 logger = logging.getLogger('decamtoyz.pipeline')
 
-class PipelineError(ToyzError):
+class PipelineError(aw.utils.utils.AstromaticError):
     pass
 
 class Pipeline(aw.pipeline.Pipeline):
@@ -76,7 +76,7 @@ class Pipeline(aw.pipeline.Pipeline):
                 recursive = aw.utils.utils.get_bool(
                     "Search '{0}' recursively for images? ('y'/'n')")
                 index.build_idx(img_path, idx_connect_str, True, recursive, True)
-        self.idx = create_engine(idx_connect_str)
+        #self.idx = create_engine(idx_connect_str)
         self.idx_connect_str = idx_connect_str
         self.temp_path = temp_path
         self.cat_path = cat_path
@@ -86,7 +86,7 @@ class Pipeline(aw.pipeline.Pipeline):
         self.default_kwargs = default_kwargs
         # IF the user doesn't specify a path for config files, use the default decam config files
         if config_path is None:
-            from decam import root
+            from decamtoyz.config import root
             self.config_path = os.path.join(root, 'default')
         else:
             self.config_path = config_path
@@ -94,11 +94,16 @@ class Pipeline(aw.pipeline.Pipeline):
         # If any of the specified paths don't exist, give the user the option to create them
         utils.check_path('temp_path', self.temp_path)
         utils.check_path('cat_path', self.cat_path)
-        utils.check_path('stack_path', self.stack_path)
+        #utils.check_path('stack_path', self.stack_path)
         
         # If the user specified a set of steps for the pipeline, add them here
         self.steps = steps
         self.next_id = 0
+        
+        # Run Parameters
+        self.run_steps = None
+        self.run_warnings = None
+        self.run_step_idx = 0
         
         # Set the time that the pipeline was created and create a directory
         # for log files
@@ -106,6 +111,10 @@ class Pipeline(aw.pipeline.Pipeline):
         self.run_date = datetime.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
         self.log_path = log_path
         aw.utils.utils.create_paths([self.log_path])
+        
+        # Set additional keyword arguements
+        for key, value in kwargs.items():
+            setattr(self, key, value)
     
     def run_swarp_old(self, step_id, filenames, stack_filename=None, api_kwargs={}, 
             frames=None, run_type='both'):

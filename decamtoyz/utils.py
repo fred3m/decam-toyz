@@ -98,9 +98,10 @@ def get_header_info(pipeline, cat_name, frame):
         gain: float
             Gain in electrons/adu
     """
+    from decamtoyz.index import query_idx
     expnum = os.path.basename(cat_name).split('-')[0]
     sql = "select * from decam_files where EXPNUM={0} and PRODTYPE='image'".format(int(expnum))
-    files = pandas.read_sql(sql, pipeline.idx)
+    files = query_idx(sql, pipeline.idx_connect_str)
     header = fits.getheader(os.path.join(pipeline.dec_path, files.iloc[0].filename), ext=0)
     exptime = header['exptime']
     airmass = 1/np.cos(np.radians(header['ZD']))
@@ -109,10 +110,28 @@ def get_header_info(pipeline, cat_name, frame):
     return exptime, airmass, gain
 
 def get_idx_info(connection, conditions=None):
+    """
+    Get general information about a decam index
+    
+    Parameters
+    ----------
+    connection: str or `sqlalchemy.engine.base.Engine`
+        If connection is a string then a sqlalchemy Engine will be created, otherwise
+        ``connection`` is an sqlalchemy database engine that will be used for the query
+    conditions: str (optional)
+        Optional conditions to limit the scope of the index query (for example only
+        get information for a given night or proposal)
+    
+    Returns
+    -------
+    idx_info: dict
+        Dictionary containing information about the index
+    """
+    from decamtoyz.index import query_idx
     sql = "select * from decam_obs"
     if conditions is not None:
         sql += " where "+conditions
-    exposures = pandas.read_sql(sql, connection)
+    exposures = query_idx(sql, connection)
     objects = exposures['object'].str.split('-').apply(pandas.Series).sort(0)[0].unique()
     proposals = exposures['propid'].unique()
     nights = exposures['cal_date'].unique()
@@ -120,12 +139,6 @@ def get_idx_info(connection, conditions=None):
     exptimes = {}
     for f in filters:
         exptimes[f] = exposures[exposures['filter'].str.startswith(f)]['exptime'].unique().tolist()
-    
-    logger.info('All proposals:\n{0}'.format(proposals))
-    logger.info('All objects:\n{0}'.format(objects))
-    logger.info('nights:\n{0}'.format(nights))
-    logger.info('filters:\n{0}'.format(filters))
-    logger.info('exptimes:\n:{0}'.format(exptimes))
     
     idx_info = {
         'proposals': proposals,
@@ -143,11 +156,12 @@ def get_exp_files(pipeline, night, obj, filtr, exptime, proctype='InstCal'):
     relevant exposure fits image, weight maps, and data quality masks and copies them into the
     pipelines temp_path directory. 
     """
+    from decamtoyz.index import query_idx
     sql = "select * from decam_obs where cal_date='{0}' and object like'{1}%'".format(night, obj)
     sql += "and object not like '%%SLEW' and filter like '{0}%' and exptime='{1}'".format(
         filtr, exptime
     )
-    exposures = pandas.read_sql(sql, pipeline.idx).sort(['expnum'])
+    exposures = query_idx(sql, pipeline.idx_connect_str).sort(['expnum'])
     expnums = exposures['expnum'].unique()
     # Get the filenames for the image. dqmask, and wtmap products for each exposure
     exp_files = {expnum:{} for expnum in expnums}
@@ -155,7 +169,7 @@ def get_exp_files(pipeline, night, obj, filtr, exptime, proctype='InstCal'):
     for idx, row in exposures.iterrows():
         sql = "select * from decam_files where EXPNUM={0} and proctype='{1}'".format(
             row['expnum'], proctype)
-        files = pandas.read_sql(sql, pipeline.idx)
+        files = query_idx(sql, pipeline.idx_connect_str)
         for fidx, file in files.iterrows():
             fits_name = get_fits_name(file['EXPNUM'], file['PRODTYPE'])
             fits_path = os.path.join(pipeline.temp_path, fits_name)

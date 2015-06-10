@@ -274,15 +274,16 @@ def cds_query(pipeline, obj, catalog, columns=None, frames=None,
         reference catalog and the values are an operator (such as '>','<','=') and
         a value. For example ``filter_columns={'e_pmRA':'<200'}.
     """
+    from decamtoyz.index import query_idx
     # Load a fits image for the given object
     sql = "select * from decam_obs where object like '{0}%'".format(obj)
-    exposures = pandas.read_sql(sql, pipeline.idx).sort(['expnum'])
+    exposures = query_idx(sql, pipeline.idx_connect_str).sort(['expnum'])
     exp = exposures.iloc[0]
     sql="select * from decam_files where expnum={0} and proctype='{1}'".format(
         exp['expnum'], proctype
     )
     sql += " and prodtype='image'"
-    files = pandas.read_sql(sql, pipeline.idx).iloc[0]
+    files = query_idx(sql, pipeline.idx_connect_str).iloc[0]
     hdulist = fits.open(files['filename'], memmap=True)
     dates = exposures['cal_date'].unique().tolist()
     obs_dates = Time(dates, format='iso').jyear

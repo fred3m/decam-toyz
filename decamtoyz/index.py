@@ -185,12 +185,29 @@ def build_idx(img_path='.', connection=None, create_new=False, recursive=False, 
 def query_idx(sql='select * from decam_files where PROCTYPE=="InstCal"', connection=None):
     """
     Query a decam index
+    
+    Parameters
+    ----------
+    sql: str
+        Query to perform on the decam index database
+    connection: str or `sqlalchemy.engine.base.Engine`
+        If connection is a string then a sqlalchemy Engine will be created, otherwise
+        ``connection`` is an sqlalchemy database engine that will be used for the query
+    
+    Returns
+    -------
+    df: `pandas.DataFrame`
+        Dataframe containing the result of the query
     """
-    from sqlalchemy import create_engine
-    import pandas
+    from sqlalchemy.engine.base import Engine
+    # If no connection is specified check in the local default directory
     if connection is None:
         ROOT_DIR = os.path.abspath(os.path.dirname(__file__))
         connection = 'sqlite:///'+os.path.join(ROOT_DIR,'decam.db')
-    engine = create_engine(connection)
-    df = pandas.read_sql(sql, engine)
+    # If the connection is a string instead of an engine, create a db Engine from the connection
+    if not isinstance(connection, Engine):
+        from sqlalchemy import create_engine
+        connection = create_engine(connection)
+    import pandas
+    df = pandas.read_sql(sql, connection)
     return df
