@@ -5,6 +5,7 @@ import logging
 import shutil
 import subprocess
 import datetime
+import warnings
 
 from astropy.io import fits
 from astropy.table import Table, join, vstack
@@ -19,8 +20,8 @@ logger = logging.getLogger('decamtoyz.catalog')
 catalog_info = {
     'SDSS9': {
         'columns': {
-            'ra': 'RAJ2000',
-            'dec': 'DEJ2000',
+            'ra': '_RAJ2000',
+            'dec': '_DEJ2000',
             'e_ra': 'e_RAJ2000',
             'e_dec': 'e_DEJ2000',
             'pm_ra': 'pmRA',
@@ -38,8 +39,8 @@ catalog_info = {
     },
     'UKIDSS9': {
         'columns': {
-            'ra': 'RAJ2000',
-            'dec': 'DEJ2000',
+            'ra': '_RAJ2000',
+            'dec': '_DEJ2000',
             'e_ra': 'e_RAJ2000',
             'e_dec': 'e_DEJ2000',
             'pm_ra': 'pmRA',
@@ -57,8 +58,8 @@ catalog_info = {
     },
     '2MASS': {
         'columns': {
-            'ra': 'RAJ2000',
-            'dec': 'DEJ2000',
+            'ra': '_RAJ2000',
+            'dec': '_DEJ2000',
             'e_ra': 'errMaj',
             'e_dec': 'errMin',
             'e_PA': 'errPA',
@@ -89,8 +90,8 @@ catalog_info = {
     },
     'UCAC4': {
         'columns': {
-            'ra': 'RAJ2000',
-            'dec': 'DEJ2000',
+            'ra': '_RAJ2000',
+            'dec': '_DEJ2000',
             'e_ra': 'ePos',
             'e_dec': 'ePos',
             'pm_ra': 'pmRA',
@@ -103,6 +104,52 @@ catalog_info = {
             'pm_units': 'mas',
             'e_pos_units': 'mas',
             'vizier_id': 'I/322A'
+        }
+    },
+    'GSC': {
+        'columns': {
+            'ra': '_RAJ2000',
+            'dec': '_DEJ2000',
+            'e_ra': 'e_RAdeg',
+            'e_dec': 'e_DEdeg',
+            'epoch': 'Epoch'
+        },
+        'info': {
+            'jyear': 'Epoch',
+            'e_pos_units': 'arcsec',
+            'vizier_id': 'I/305'
+        }
+    },
+    'DENIS': {
+        'columns': {
+            'ra': '_RAJ2000',
+            'dec': '_DEJ2000',
+            'epoch': 'ObsJD'
+        },
+        'info': {
+            'mjd': 'ObsJD',
+            'e_pos_units': 'mas',
+            'e_pos': '400',
+            'vizier_id': 'B/denis'
+        }
+    },
+    'USNOB1': {
+        'columns': {
+            'ra': '_RAJ2000',
+            'dec': '_DEJ2000',
+            'e_ra': 'e_RAJ2000',
+            'e_dec': 'e_DEJ2000',
+            'pm_ra': 'pmRA',
+            'pm_dec': 'pmDE',
+            'e_pm_ra': 'e_pmRA',
+            'e_pm_dec': 'e_pmDE',
+            'epoch': 'Epoch'
+        },
+        'info': {
+            'jyear': 'Epoch',
+            'pm_units': 'mas',
+            'e_pos_units': 'mas',
+            'vizier_id': 'I/284'
         }
     }
 }
@@ -208,8 +255,11 @@ def update_refcat(cat_name, refcat, obs_dates):
     for col in ['pm_ra', 'pm_dec', 'e_pm_ra', 'e_pm_dec']:
         if col in cat_info['columns']:
             refcat[col].convert_unit_to(apu.mas/apu.year)
-    refcat['e_ra'].convert_unit_to(apu.mas)
-    refcat['e_dec'].convert_unit_to(apu.mas)
+    if 'e_ra' in refcat.columns and 'e_dec' in refcat.columns:
+        refcat['e_ra'].convert_unit_to(apu.mas)
+        refcat['e_dec'].convert_unit_to(apu.mas)
+    else:
+        warnings.warn("{0} was missing 'e_ra' and 'e_dec'".format(cat_name))
     
     # Tables do not add,subtract, multiply, or divide quantities properly so
     # we need to incldue a conversion factor from mas to deg
@@ -247,13 +297,13 @@ def update_refcat(cat_name, refcat, obs_dates):
     return refcat
 
 def cds_query(pipeline, obj, catalog, columns=None, frames=None,
-        proctype='InstCal', filter_columns=None):
+        proctype='InstCal', filter_columns=None, obs_dates=None):
     """
     Use cdsclient vizquery to query vizier and return a reference catalog
     
     Parameters
     ----------
-    pipeline: astro-toyz.pipeline.Pipeline
+    pipeline: astromatic_wrapper.Pipeline
         Pipeline containing index info
     obj: str
         Name of the DECam object
@@ -285,8 +335,10 @@ def cds_query(pipeline, obj, catalog, columns=None, frames=None,
     sql += " and prodtype='image'"
     files = query_idx(sql, pipeline.idx_connect_str).iloc[0]
     hdulist = fits.open(files['filename'], memmap=True)
-    dates = exposures['cal_date'].unique().tolist()
-    obs_dates = Time(dates, format='iso').jyear
+    if obs_dates is None:
+        dates = exposures['cal_date'].unique().tolist()
+        obs_dates = Time(dates, format='iso').jyear
+    logger.info('Loading {0} for {1}'.format(catalog, obj))
     
     if frames is None:
         # Get the ra and dec range for the entire field of view
@@ -302,7 +354,7 @@ def cds_query(pipeline, obj, catalog, columns=None, frames=None,
             frames = range(1, len(hdulist))
         refcat = None
         for frame in frames:
-            logger.debug('querying frame: {0}'.format(frame))
+            logger.info('querying frame: {0}'.format(frame))
             # Get the ra and dec range for the current frame
             header = hdulist[frame].header
             min_ra, max_ra, min_dec, max_dec = get_query_region(
@@ -327,6 +379,6 @@ def cds_query(pipeline, obj, catalog, columns=None, frames=None,
     except ValueError:
         refcat.meta={}
         new_hdulist = aw.utils.ldac.convert_table_to_ldac(refcat)
-    cat_path = os.path.join(pipeline.cat_path, 'ref', "{0}-{1}.fits".format(obj, catalog))
+    cat_path = os.path.join(pipeline.paths['catalogs'], 'ref', "{0}-{1}.fits".format(obj, catalog))
     new_hdulist.writeto(cat_path, clobber=True)
     logger.info('saved {0}'.format(cat_path))

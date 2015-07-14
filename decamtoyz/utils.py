@@ -13,6 +13,12 @@ import logging
 
 logger = logging.getLogger('decamtoyz.utils')
 
+class DecamError(Exception):
+    """
+    Errors occuring in DECam tools
+    """
+    pass
+    
 def get_fits_name(expnum, prodtype):
     """
     Get the name of a fits image based on its exposure number and prodtype
@@ -74,7 +80,7 @@ def check_path(pathname, path):
         if core.get_bool("{0} '{1}' does not exist, create (y/n)?".format(pathname, path)):
             core.create_paths(path)
         else:
-            raise PipelineError("{0} does not exist".format(pathname))
+            raise DecamError("{0} does not exist".format(pathname))
 
 def get_header_info(pipeline, cat_name, frame):
     """
@@ -82,7 +88,7 @@ def get_header_info(pipeline, cat_name, frame):
     
     Parameters
     ----------
-    pipeline: `decamtoyz.pipeline.Pipeline`
+    pipeline: :class:`.Pipeline`
         Object that contains parameters about a decam pipeline
     cat_name: str
         Name of a catalog that contains a list of sources found using decamtoyz
@@ -102,10 +108,10 @@ def get_header_info(pipeline, cat_name, frame):
     expnum = os.path.basename(cat_name).split('-')[0]
     sql = "select * from decam_files where EXPNUM={0} and PRODTYPE='image'".format(int(expnum))
     files = query_idx(sql, pipeline.idx_connect_str)
-    header = fits.getheader(os.path.join(pipeline.dec_path, files.iloc[0].filename), ext=0)
+    header = fits.getheader(os.path.join(pipeline.paths['decam'], files.iloc[0].filename), ext=0)
     exptime = header['exptime']
     airmass = 1/np.cos(np.radians(header['ZD']))
-    header = fits.getheader(os.path.join(pipeline.dec_path, files.iloc[0].filename), ext=frame)
+    header = fits.getheader(os.path.join(pipeline.paths['decam'], files.iloc[0].filename), ext=frame)
     gain = header['arawgain']
     return exptime, airmass, gain
 
@@ -150,7 +156,8 @@ def get_idx_info(connection, conditions=None):
     
     return idx_info
 
-def get_exp_files(pipeline, night, obj, filtr, exptime, proctype='InstCal'):
+def get_exp_files(pipeline, night, obj, filtr, exptime, proctype='InstCal', 
+        prep_files=False):
     """
     Get all of the exposures for a given night, object, and filter. This funpacks the
     relevant exposure fits image, weight maps, and data quality masks and copies them into the
@@ -173,21 +180,58 @@ def get_exp_files(pipeline, night, obj, filtr, exptime, proctype='InstCal'):
         for fidx, file in files.iterrows():
             fits_name = get_fits_name(file['EXPNUM'], file['PRODTYPE'])
             fits_path = os.path.join(pipeline.temp_path, fits_name)
-            funpack_file(file['filename'], fits_path)
+            # Funpack the file
+            if prep_files:
+                funpack_file(file['filename'], fits_path)
             exp_files[file['EXPNUM']][file['PRODTYPE']] = fits_path
             if file['PRODTYPE']=='image':
                 all_exposures.append(fits_path)
-                create_ahead(file['EXPNUM'], pipeline.temp_path)
+                # Create ahead files
+                if prep_files:
+                    create_ahead(file['EXPNUM'], pipeline.temp_path)
     return (exposures, expnums, exp_files, all_exposures)
 
+def funpack_exposures(idx_connect_str, exposures, temp_path, proctype='InstCal'):
+    """
+    Run funpack to unpack compressed fits images (fits.fz) so that the
+    AstrOmatic suite can read them. This also creates an ahead file for each
+    image that can be used by SCAMP containing the appropriate header
+    information
+    
+    Parameters
+    ----------
+    idx_connect_str: str
+        Connection to database containing decam observation index
+    exposures: `pandas.DataFrame`
+        DataFrame with information about the observations
+    temp_path: str
+        Temporary directory where files are stored for pipeline processing
+    proctype: str
+        PROCTYPE from DECam image header (processing type of product from 
+        DECam community pipeline)
+    """
+    from decamtoyz.index import query_idx
+    expnums = exposures['expnum'].unique()
+    # Get the filenames for the image, dqmask, and wtmap products for each exposure
+    for idx, row in exposures.iterrows():
+        sql = "select * from decam_files where EXPNUM={0} and proctype='{1}'".format(
+            row['expnum'], proctype)
+        files = query_idx(sql, idx_connect_str)
+        for fidx, file_info in files.iterrows():
+            fits_name = get_fits_name(file_info['EXPNUM'], file_info['PRODTYPE'])
+            fits_path = os.path.join(temp_path, fits_name)
+            funpack_file(file_info['filename'], fits_path)
+            if file_info['PRODTYPE']=='image':
+                create_ahead(file_info['EXPNUM'], temp_path)
+
 def match_standard(pipeline, cat_names, ref_cat, filtr, ref_ra_name, ref_dec_name,
-        ref_fields, frames=range(1,62)):
+        ref_fields, frames=range(1,62), ignore_empty=False):
     """
     Match a list of catalogs to a reference catalog.
     
     Parameters
     ----------
-    pipeline: `decamtoyz.pipeline.Pipeline`
+    pipeline: :class:`~astromatic_wrapper.uitls.pipeline.Pipeline`
         Object that contains parameters about a decam pipeline
     cat_names: list of strings
         Names of catalog files to use in reduction
@@ -207,6 +251,9 @@ def match_standard(pipeline, cat_names, ref_cat, filtr, ref_ra_name, ref_dec_nam
         the refernce catalog.
     frames: list of strings
         List of frame numbers (as strings) to match to the reference catalog
+    ignore_empty: bool (optional)
+        By default if there are no matches between the reference catalog and one of the
+        source frames, an exception is raised. To ignore this exception set ``ignore_empty=True``.
     
     Returns
     -------
@@ -227,7 +274,8 @@ def match_standard(pipeline, cat_names, ref_cat, filtr, ref_ra_name, ref_dec_nam
             exptime, airmass, gain = get_header_info(pipeline, cat_name, frame)
             logger.info('{0}: airmass={1}, exptime={2}, filename={3}'.format(cat_name, airmass, 
                 exptime, cat_name))
-            cat_frame = Table.read(os.path.join(pipeline.cat_path, cat_name), hdu=frame)
+            cat_frame = Table.read(os.path.join(pipeline.paths['catalog'], cat_name), hdu=frame)
+            cat_frame['FLUX_PSF'][cat_frame['FLUX_PSF'] * gain/exptime ==0] = np.nan
             cat_frame[filtr] = -2.5*np.log10(cat_frame['FLUX_PSF'] * gain/exptime)
             cat_frame['airmass'] = airmass
             cat_frame['filename'] = cat_name
@@ -245,16 +293,23 @@ def match_standard(pipeline, cat_names, ref_cat, filtr, ref_ra_name, ref_dec_nam
             cat_columns = [cat_frame['XWIN_WORLD'], cat_frame['YWIN_WORLD'],
                 cat_frame['airmass'], cat_frame['filename'], cat_frame['frame'],
                 cat_frame[filtr], cat_frame['MAG_PSF'], cat_frame['MAG_AUTO'],
-                cat_frame['MAGERR_PSF'], d2.to('arcsec')] + ref_columns
+                cat_frame['MAGERR_PSF'], d2.to('arcsec'), cat_frame['FLAGS'],
+                cat_frame['FLAGS_WEIGHT']] + ref_columns
             cat_colnames = ['ra', 'dec', 'airmass', 'filename', 'ccd',
                 filtr, 'psf_'+filtr, 'aper_'+filtr, 
-                'err_'+filtr, 'separation'] + ref_colnames
+                'err_'+filtr, 'separation', 'FLAGS', 'FLAGS_WEIGHT'] + ref_colnames
             catalog = Table(cat_columns, names=tuple(cat_colnames))
             
             # Only use entries where the sources are closer than 1 arcsec and add them to the total catalog
-            catalog = catalog[d2.to('arcsec')<1*apu.arcsec]
+            good_catalog = catalog[d2.to('arcsec')<1*apu.arcsec]
+            if len(good_catalog)==0:
+                if ignore_empty:
+                    import warnings
+                    warnings.warn("No matching entries for {0}".format(cat_name))
+                else:
+                    raise Exception("No matching entries for {0}".format(cat_name))
             if sources is None:
-                sources = catalog
+                sources = good_catalog
             else:
-                sources = vstack([sources, catalog])
+                sources = vstack([sources, good_catalog])
     return sources

@@ -116,6 +116,10 @@ def clean_sources(obs, mag_name, ref_name, check_columns=[], clipping=1):
     else:
         good_sources = obs
     
+    # Remove sources that have been flagged by SExtractor as bad
+    good_sources = good_sources[(good_sources['FLAGS']==0) &
+                                (good_sources['FLAGS_WEIGHT']==0)]
+    
     # Remove the 5 brightest stars (might be saturated) and use range of 5 mags
     obs_min = np.sort(good_sources[mag_name])[5]
     obs_max = obs_min+5
@@ -128,8 +132,6 @@ def clean_sources(obs, mag_name, ref_name, check_columns=[], clipping=1):
     
     return good_sources
 
-#import ipydebug
-#@ipydebug.func_breakpoint(activate=True)
 def calculate_magnitude(coeff, ref_mag1, ref_mag2, airmass):
     """
     Calculate the estimated instrumental magnitude of a source given a set of reference 
@@ -156,6 +158,8 @@ def calculate_magnitude(coeff, ref_mag1, ref_mag2, airmass):
     result = ref_mag1 + coeff[0] + coeff[1]*(ref_mag1-ref_mag2) + coeff[2]*airmass
     return result
 
+#import ipydebug
+#@ipydebug.func_breakpoint(activate=True)
 def err_magnitude_chi2(coeff, instr_mag, ref_mag1, ref_mag2, airmass, weight=1):
     """
     Calculate the chi*2 error from a set of instrumental magnitudes to a set of reference 
@@ -188,7 +192,7 @@ def err_magnitude_chi2(coeff, instr_mag, ref_mag1, ref_mag2, airmass, weight=1):
     return weight * (instr_mag - calculate_magnitude(coeff, ref_mag1, ref_mag2, airmass))
 
 def calibrate_standard(sources, mag_name, ref1_name, ref2_name, mag_err_name, ref1_err_name, 
-        ref2_err_name, init_zero=-20, init_color=-.1, init_extinction=-.1):
+        ref2_err_name, init_zero=-25, init_color=-.1, init_extinction=.1):
     """
     Calibrate a standard field with a set of refernce fields
     
@@ -222,15 +226,24 @@ def calibrate_standard(sources, mag_name, ref1_name, ref2_name, mag_err_name, re
     weight = 1/np.sqrt(good_sources[ref1_err_name]**2+
                        good_sources[ref2_err_name]**2+
                        good_sources[mag_err_name]**2)
-    init_params = [init_zero, init_color, init_extinction]
-    instr_mag = good_sources[mag_name]
-    ref_mag1 = good_sources[ref1_name]
-    ref_mag2 = good_sources[ref2_name]
-    airmass = good_sources['airmass']
-    result = leastsq(err_magnitude_chi2, init_params, args=(instr_mag, ref_mag1, 
-        ref_mag2, airmass, weight), full_output=False)
-    logger.info("Zero point: {0}\nColor Correction: {1}\nExtinction: {2}\n".format(*result[0]))
-    return result[0]
+    logger.debug('max error: {0}'.format(1.0/np.min(weight)))
+    logger.debug('min error: {0}'.format(1.0/np.max(weight)))
+    #init_params = [init_zero, init_color, init_extinction]
+    #instr_mag = good_sources[mag_name]
+    #ref_mag1 = good_sources[ref1_name]
+    #ref_mag2 = good_sources[ref2_name]
+    #airmass = good_sources['airmass']
+    #result = leastsq(err_magnitude_chi2, init_params, args=(instr_mag, ref_mag1, 
+    #    ref_mag2, airmass, weight), full_output=True)
+    import statsmodels.formula.api as smf
+    good_sources['diff'] = good_sources[mag_name] - good_sources[ref1_name]
+    good_sources['color'] = good_sources[ref1_name] - good_sources[ref2_name]
+    result = smf.WLS.from_formula(formula='diff ~ color + airmass', data=good_sources,
+        weights=weight).fit()
+    results = [result.params.Intercept, result.params.color, result.params.airmass],result
+    
+    logger.debug("Zero point: {0}\nColor Correction: {1}\nExtinction: {2}\n".format(*results[0]))
+    return results
 
 def calibrate_2band(instr1, instr2, airmass1, airmass2, coeff1, coeff2):
     """
