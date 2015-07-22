@@ -1,5 +1,4 @@
 import numpy as np
-from scipy.optimize import leastsq
 import matplotlib
 import matplotlib.pyplot as plt
 import logging
@@ -132,67 +131,18 @@ def clean_sources(obs, mag_name, ref_name, check_columns=[], clipping=1):
     
     return good_sources
 
-def calculate_magnitude(coeff, ref_mag1, ref_mag2, airmass):
+def calculate_magnitude(x, zero, color, extinct):
     """
-    Calculate the estimated instrumental magnitude of a source given a set of reference 
-    observations and coefficients.
-    
-    Parameters
-    ----------
-    coeff: tuple
-        Coefficients to solve for during calibration. This is the tuple
-        (zero_point, color_coefficient, extinction_coefficient)
-    ref_mag1: float or array-like of floats
-        Reference magnitude of the observation in the same filter
-    ref_mag2: float or array-like of floats
-        Refernce magnitude of the observation in a different filter, used to calculate the color 
-        coefficient
-    airmass: float or array-like of floats
-        Sec(zenith distance)
-    
-    Return
-    ------
-    magnitude: float
-        The estimated instrumental magnitude given the set of coefficents and reference magnitudes
+    x[0] = reference in instrument band
+    x[1] = reference in other band
+    x[2] = airmass
     """
-    result = ref_mag1 + coeff[0] + coeff[1]*(ref_mag1-ref_mag2) + coeff[2]*airmass
-    return result
-
-#import ipydebug
-#@ipydebug.func_breakpoint(activate=True)
-def err_magnitude_chi2(coeff, instr_mag, ref_mag1, ref_mag2, airmass, weight=1):
-    """
-    Calculate the chi*2 error from a set of instrumental magnitudes to a set of reference 
-    magnitudes given a set of coefficients.
-    
-    Parameters
-    ----------
-    coeff: tuple
-        Coefficients to solve for during calibration. This is the tuple
-        (zero_point, color_coefficient, extinction_coefficient)
-    instr_mag: array-like of floats
-        Magnitude measured by the instrument
-    ref_mag1: array-like of floats
-        Reference magnitude of the observation in the same filter as ``instr_mag``
-    ref_mag2: array-like of floats
-        Refernce magnitude of the observation in a different filter, used to calculate 
-        the color coefficient
-    airmass: float or array-like of floats
-        Sec(zenith distance)
-    weight: float or array-like of floats (optional)
-        Weight to assign to each measurement. This is often the combined error for each 
-        measurement but defaults to 1.
-    
-    Return
-    ------
-    result: array-like of floats
-        Weighted differnce between the instrumental magnitude and the estimated instrumental 
-        magnitude given the current set of coefficients and refernce magnitudes.
-    """
-    return weight * (instr_mag - calculate_magnitude(coeff, ref_mag1, ref_mag2, airmass))
+    #return (x[0]-zero+color*x[1]-extinct*x[2])/(1+color)
+    return x[0] + zero + color*(x[0]-x[1]) + extinct*x[2]
 
 def calibrate_standard(sources, mag_name, ref1_name, ref2_name, mag_err_name, ref1_err_name, 
-        ref2_err_name, init_zero=-25, init_color=-.1, init_extinction=.1):
+        ref2_err_name, init_zero=-25, init_color=-.1, init_extinction=.1,
+        fit_package='scipy'):
     """
     Calibrate a standard field with a set of refernce fields
     
@@ -219,29 +169,25 @@ def calibrate_standard(sources, mag_name, ref1_name, ref2_name, mag_err_name, re
     init_extinction: float
         Initial guess for the extinction coefficient
     """
-    # Remove points that are major outliers
-    diff = sources[mag_name]-sources[ref1_name]
-    good_sources = sources[np.sqrt((diff-np.mean(diff))**2)<np.std(diff)]
+    good_sources = sources
+    init_params = [init_zero, init_color, init_extinction]
+    instr_mag = good_sources[mag_name]
+    ref_mag1 = good_sources[ref1_name]
+    ref_mag2 = good_sources[ref2_name]
+    airmass = good_sources['airmass']
     
-    weight = 1/np.sqrt(good_sources[ref1_err_name]**2+
-                       good_sources[ref2_err_name]**2+
-                       good_sources[mag_err_name]**2)
-    logger.debug('max error: {0}'.format(1.0/np.min(weight)))
-    logger.debug('min error: {0}'.format(1.0/np.max(weight)))
-    #init_params = [init_zero, init_color, init_extinction]
-    #instr_mag = good_sources[mag_name]
-    #ref_mag1 = good_sources[ref1_name]
-    #ref_mag2 = good_sources[ref2_name]
-    #airmass = good_sources['airmass']
-    #result = leastsq(err_magnitude_chi2, init_params, args=(instr_mag, ref_mag1, 
-    #    ref_mag2, airmass, weight), full_output=True)
-    import statsmodels.formula.api as smf
-    good_sources['diff'] = good_sources[mag_name] - good_sources[ref1_name]
-    good_sources['color'] = good_sources[ref1_name] - good_sources[ref2_name]
-    result = smf.WLS.from_formula(formula='diff ~ color + airmass', data=good_sources,
-        weights=weight).fit()
-    results = [result.params.Intercept, result.params.color, result.params.airmass],result
-    
+    if fit_package=='scipy':
+        from scipy.optimize import curve_fit
+        x = [ref_mag1,ref_mag2,airmass]
+        results = curve_fit(calculate_magnitude, x, instr_mag, init_params)
+    elif fit_package=='statsmodels':
+        import statsmodels.formula.api as smf
+        good_sources['diff'] = good_sources[mag_name] - good_sources[ref1_name]
+        good_sources['color'] = good_sources[ref1_name] - good_sources[ref2_name]
+        result = smf.OLS.from_formula(formula='diff ~ color + airmass', data=good_sources).fit()
+        results = [result.params.Intercept, result.params.color, result.params.airmass],result
+    else:
+        raise Exception("fit_package must be either 'statsmodels' or 'scipy'(default)")
     logger.debug("Zero point: {0}\nColor Correction: {1}\nExtinction: {2}\n".format(*results[0]))
     return results
 
@@ -294,8 +240,8 @@ def calibrate_2band(instr1, instr2, airmass1, airmass2, coeff1, coeff2):
     b1 = instr1 - coeff1[0] - coeff1[2]*airmass1
     b2 = instr2 - coeff2[0] - coeff2[2]*airmass2
     d = 1 + coeff1[1] + coeff2[1]
-    mag1 = (coeff1[1]*b2 + coeff2[1]*b1+b1) / d
-    mag2 = (coeff2[1]*b1 + coeff1[1]*b2+b2) / d
+    mag1 = (coeff1[1]*b2 + b1*(1+coeff2[1])) / d
+    mag2 = (coeff2[1]*b1 + b2*(1+coeff1[1])) / d
     return (mag1,mag2)
 
 def calibrate_1band(instr, airmass, coeff, color_band=None):
